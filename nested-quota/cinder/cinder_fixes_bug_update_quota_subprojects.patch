@@ -1,0 +1,142 @@
+From efaf8842e3efa0d0686cecfda987defa97fb20b1 Mon Sep 17 00:00:00 2001
+From: Erickson Santos <erickson@lsd.ufcg.edu.br>
+Date: Tue, 15 Sep 2015 14:21:42 -0300
+Subject: [PATCH] Fix update quota of subprojects
+
+Cinder raises an exception when performing an update quota
+operation in a subproject in which its parent's quotas weren't
+explicitly updated.
+
+This is because cinder will try to find the parent's quotas
+in order to update the allocated value. But, since the parent's
+quotas are the default quotas (i.e. there are no entries for them
+in the database), the operation will raise an error.
+
+Steps to reproduce:
+1. Create a project A in keystone;
+2. Create a project B in keystone with A as its parent;
+3. Try to update the quota value of any resources of project B
+   (e.g. openstack quota set <id of B> --volumes 2)
+
+This patch fix this bug by adding entries to the database when
+performing an update quota operation in a subproject and there
+are still no quota associated with the parent project.
+
+Change-Id: Ia732ca9d5a5f59d3973c2656a27b666077c3402a
+Closes-bug: #1495990
+---
+ cinder/api/contrib/quotas.py                 | 15 ++++++++++-----
+ cinder/db/api.py                             |  5 +++--
+ cinder/db/sqlalchemy/api.py                  |  4 +++-
+ cinder/tests/unit/api/contrib/test_quotas.py | 12 ++++++++++++
+ 4 files changed, 28 insertions(+), 8 deletions(-)
+
+diff --git a/cinder/api/contrib/quotas.py b/cinder/api/contrib/quotas.py
+index 27f0401..4d46891 100644
+--- a/cinder/api/contrib/quotas.py
++++ b/cinder/api/contrib/quotas.py
+@@ -80,7 +80,7 @@ class QuotaSetsController(wsgi.Controller):
+             free_quota = (parent_project_quotas[key]['limit'] -
+                           parent_project_quotas[key]['in_use'] -
+                           parent_project_quotas[key]['reserved'] -
+-                          parent_project_quotas[key]['allocated'])
++                          parent_project_quotas[key].get('allocated', 0))
+ 
+             current = 0
+             if project_quotas.get(key):
+@@ -286,7 +286,7 @@ class QuotaSetsController(wsgi.Controller):
+                                              target_project.id,
+                                              parent_id)
+             parent_project_quotas = QUOTAS.get_project_quotas(
+-                context, parent_id, parent_project_id=parent_id)
++                context, parent_id)
+ 
+         # NOTE(ankit): Pass #2 - In this loop for body['quota_set'].keys(),
+         # we validate the quota limits to ensure that we can bail out if
+@@ -309,7 +309,7 @@ class QuotaSetsController(wsgi.Controller):
+                                                    quota_values,
+                                                    parent_project_quotas)
+                 allocated_quotas[key] = (
+-                    parent_project_quotas[key]['allocated'] + value)
++                    parent_project_quotas[key].get('allocated', 0) + value)
+             else:
+                 value = self._validate_quota_limit(body['quota_set'], key)
+             valid_quotas[key] = value
+@@ -330,8 +330,13 @@ class QuotaSetsController(wsgi.Controller):
+             # atomic operation.
+             if parent_id:
+                 if key in allocated_quotas.keys():
+-                    db.quota_allocated_update(context, parent_id, key,
+-                                              allocated_quotas[key])
++                    try:
++                        db.quota_allocated_update(context, parent_id, key,
++                                                  allocated_quotas[key])
++                    except exception.ProjectQuotaNotFound:
++                        parent_limit = parent_project_quotas[key]['limit']
++                        db.quota_create(context, parent_id, key, parent_limit,
++                                        allocated=allocated_quotas[key])
+ 
+         return {'quota_set': self._get_quotas(context, target_project_id,
+                                               parent_project_id=parent_id)}
+diff --git a/cinder/db/api.py b/cinder/db/api.py
+index 5fe56e4..f5bb175 100644
+--- a/cinder/db/api.py
++++ b/cinder/db/api.py
+@@ -722,9 +722,10 @@ def volume_glance_metadata_copy_from_volume_to_volume(context,
+ ###################
+ 
+ 
+-def quota_create(context, project_id, resource, limit):
++def quota_create(context, project_id, resource, limit, allocated=0):
+     """Create a quota for the given project and resource."""
+-    return IMPL.quota_create(context, project_id, resource, limit)
++    return IMPL.quota_create(context, project_id, resource, limit,
++                             allocated=allocated)
+ 
+ 
+ def quota_get(context, project_id, resource):
+diff --git a/cinder/db/sqlalchemy/api.py b/cinder/db/sqlalchemy/api.py
+index 622b7eb..131eed7 100644
+--- a/cinder/db/sqlalchemy/api.py
++++ b/cinder/db/sqlalchemy/api.py
+@@ -563,11 +563,13 @@ def quota_allocated_get_all_by_project(context, project_id):
+ 
+ 
+ @require_admin_context
+-def quota_create(context, project_id, resource, limit):
++def quota_create(context, project_id, resource, limit, allocated):
+     quota_ref = models.Quota()
+     quota_ref.project_id = project_id
+     quota_ref.resource = resource
+     quota_ref.hard_limit = limit
++    if allocated:
++        quota_ref.allocated = allocated
+ 
+     session = get_session()
+     with session.begin():
+diff --git a/cinder/tests/unit/api/contrib/test_quotas.py b/cinder/tests/unit/api/contrib/test_quotas.py
+index cb39108..a435af1 100644
+--- a/cinder/tests/unit/api/contrib/test_quotas.py
++++ b/cinder/tests/unit/api/contrib/test_quotas.py
+@@ -300,6 +300,18 @@ class QuotaSetsControllerTest(test.TestCase):
+         self.assertRaises(webob.exc.HTTPForbidden, self.controller.update,
+                           self.req, self.B.id, body)
+ 
++    def test_update_subproject_quota_when_parent_has_default_quotas(self):
++        self.controller._get_project = mock.Mock()
++        self.controller._get_project.side_effect = self._get_project
++        # Since the quotas of the project A were not updated, it will have
++        # default quotas.
++        self.req.environ['cinder.context'].project_id = self.A.id
++        # Update the project B quota.
++        expected = make_body(gigabytes=1000, snapshots=10,
++                             volumes=5, backups=5, tenant_id=None)
++        result = self.controller.update(self.req, self.B.id, expected)
++        self.assertDictMatch(expected, result)
++
+     @mock.patch(
+         'cinder.api.openstack.wsgi.Controller.validate_string_length')
+     @mock.patch(
+-- 
+1.9.1
+

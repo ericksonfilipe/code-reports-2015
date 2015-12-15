@@ -1,0 +1,205 @@
+From 7fe142ffe578f3878e57a9bd6f0e1e6913463dbb Mon Sep 17 00:00:00 2001
+From: Erickson Santos <erickson@lsd.ufcg.edu.br>
+Date: Thu, 3 Dec 2015 18:04:08 -0300
+Subject: [PATCH] Add documentation for Nested Quotas on Cinder
+
+This serves as a very general introduction for nested quotas on
+Cinder.
+
+Change-Id: I182720b006c9ed441a476cc0d4feb2a3553f7b63
+---
+ doc/config-ref-rst/source/block-storage.rst        |   1 +
+ .../source/block-storage/nested-quota.rst          | 169 +++++++++++++++++++++
+ 2 files changed, 170 insertions(+)
+ create mode 100644 doc/config-ref-rst/source/block-storage/nested-quota.rst
+
+diff --git a/doc/config-ref-rst/source/block-storage.rst b/doc/config-ref-rst/source/block-storage.rst
+index b706a95..5c5c90d 100644
+--- a/doc/config-ref-rst/source/block-storage.rst
++++ b/doc/config-ref-rst/source/block-storage.rst
+@@ -11,6 +11,7 @@ Block Storage
+    block-storage/block-storage-sample-configuration-files.rst
+    block-storage/cinder-log-files.rst
+    block-storage/fc-zoning.rst
++   block-storage/nested-quota.rst
+    block-storage/volume-encryption.rst
+    block-storage/volume-misc.rst
+    tables/conf-changes/cinder.rst
+diff --git a/doc/config-ref-rst/source/block-storage/nested-quota.rst b/doc/config-ref-rst/source/block-storage/nested-quota.rst
+new file mode 100644
+index 0000000..52fccc9
+--- /dev/null
++++ b/doc/config-ref-rst/source/block-storage/nested-quota.rst
+@@ -0,0 +1,169 @@
++=================
++Nested quotas
++=================
++
++Nested quota is a change in how OpenStack services (such as Block Storage and
++Compute) handle their quota resources by being hierarchy-aware. The main
++reason for this change is to fully appreciate the hierarchical multitenancy
++concept, which was introduced in keystone in the Kilo release.
++
++Once you have a project hierarchy created in keystone, nested quotas let you
++define how much of a project's quota you want to give to its subprojects. In
++that way, hierarchical projects can have hierarchical quotas (as kown as
++nested quotas).
++
++Projects and subprojects have similar behaviours, but they differ from each
++other when it comes to default quota values. The default quota value for
++resources in a subproject is 0, so that when a subproject is created it won't
++consume all of its parent's quota.
++
++In order to keep track of how much of each quota was allocated to a
++subproject, a column ``allocated`` was added to the quotas table. This column
++is updated after every delete and update quota operation.
++
++This example shows you how to use nested quotas.
++
++**Assumptions.** Assume that you have created a project hierarchy in
++keystone, such as follows:
++
++  .. code-block:: console
++
++     +-----------+
++     |           |
++     |     A     |
++     |    / \    |
++     |   B   C   |
++     |  /        |
++     | D         |
++     +-----------+
++
++Getting default quotas
++~~~~~~~~~~~~~~~~~~~~~~
++
++#. Get quota for root projects
++
++   Use the cinder :command:`quota-show` command and specify:
++
++   -  The ``TENANT_ID`` of the relevant project the quota.
++      In this case, the id of project A.
++
++   .. code-block:: console
++
++      $ cinder quota-show TENANT_ID
++      +-----------------------+-------+
++      |        Property       | Value |
++      +-----------------------+-------+
++      |    backup_gigabytes   |  1000 |
++      |        backups        |   10  |
++      |       gigabytes       |  1000 |
++      | gigabytes_lvmdriver-1 |   -1  |
++      |  per_volume_gigabytes |   -1  |
++      |       snapshots       |   10  |
++      | snapshots_lvmdriver-1 |   -1  |
++      |        volumes        |   10  |
++      |  volumes_lvmdriver-1  |   -1  |
++      +-----------------------+-------+
++
++   .. note::
++
++      This command returns the default values for resources.
++      This is because the quotas for this project were not explictly set.
++
++#. Get quota for subprojects
++
++   In this case, use the same :command:`quota-show` command and specify:
++
++   -  The ``TENANT_ID`` of the relevant project.
++      In this case the id of project B, which is child of A.
++
++   .. code-block:: console
++
++      $ cinder quota-show TENANT_ID
++      +-----------------------+-------+
++      |        Property       | Value |
++      +-----------------------+-------+
++      |    backup_gigabytes   |   0   |
++      |        backups        |   0   |
++      |       gigabytes       |   0   |
++      | gigabytes_lvmdriver-1 |   0   |
++      |  per_volume_gigabytes |   0   |
++      |       snapshots       |   0   |
++      | snapshots_lvmdriver-1 |   0   |
++      |        volumes        |   0   |
++      |  volumes_lvmdriver-1  |   0   |
++      +-----------------------+-------+
++
++   .. note::
++
++      In this case, 0 was the value returned as the quota for all the
++      resources. This is because the project B is a subproject of A, thus,
++      the default quota value is 0, so that it will not consume all the
++      quota of its parent project.
++
++Setting the quotas for subprojects
++~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
++
++Now that the projects were created, assume that the admin of the project
++B wants to use it. First of all, you need to set the quota limit of the
++project, because as a subproject it does not have quotas allocated by
++default.
++
++In this example, when all of the parent project is allocated to its
++subprojects the user will not be able to create more resources in the parent
++project.
++
++#. Update the quota of B
++
++   Use the :command:`quota-update` command and specify:
++
++   -  The ``TENANT_ID`` of the relevant project.
++      In this case the id of project B.
++
++   - The ``--volumes`` option, followed by the number to which you wish to
++     increase the volumes quota.
++
++   .. code-block:: console
++
++      $ cinder quota-update TENANT_ID --volumes 10
++      +-----------------------+-------+
++      |        Property       | Value |
++      +-----------------------+-------+
++      |    backup_gigabytes   |   0   |
++      |        backups        |   0   |
++      |       gigabytes       |   0   |
++      | gigabytes_lvmdriver-1 |   0   |
++      |  per_volume_gigabytes |   0   |
++      |       snapshots       |   0   |
++      | snapshots_lvmdriver-1 |   0   |
++      |        volumes        |   10  |
++      |  volumes_lvmdriver-1  |   0   |
++      +-----------------------+-------+
++
++   .. note::
++
++      The volumes resource quota is updated.
++
++#. Try to create a volume in project A
++
++   Use the :command:`create` command and specify:
++
++   - The ``SIZE`` of the volume that will be created;
++
++   - The ``NAME`` of the volume.
++
++   .. code-block:: console
++
++      $ cinder create --size SIZE NAME
++      VolumeLimitExceeded: Maximum number of volumes allowed (10) exceeded for quota 'volumes'. (HTTP 413) (Request-ID: req-f6f7cc89-998e-4a82-803d-c73c8ee2016c)
++
++   .. note::
++
++      As the entirety of project A's volumes quota has been assigned to
++      project B, it is treated as if all of the quota has been used. This
++      is true even when project B has not created any volumes.
++
++See `cinder nested quota spec
++<http://specs.openstack.org/openstack/cinder-specs/specs/liberty/cinder-nested-quota-driver.html>`_
++and `hierarchical multitenancy spec
++<https://blueprints.launchpad.net/keystone/+spec/hierarchical-multitenancy>`_
++for details.
+-- 
+1.9.1
+

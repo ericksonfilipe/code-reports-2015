@@ -1,0 +1,1075 @@
+From 3fc1c77973df5584a0c6297454639e8d4ccd42d5 Mon Sep 17 00:00:00 2001
+From: Erickson Santos <erickson@lsd.ufcg.edu.br>
+Date: Tue, 10 Nov 2015 15:41:46 -0300
+Subject: [PATCH] Nested Quota Driver
+
+Nested Quota Driver patch adds hierarchical support. Quota
+API now can also handle hierarchical projects.
+
+For the first pass only a user with admin role in a parent project
+will be able to update and delete its children quotas.
+
+Even after these changes are made, the existing DbQuotaDriver
+functionalities will remain unchanged. The same driver will be able to
+handle flat projects as well as hierarchical projects.
+
+Co-Authored-By: Raildo Mascena <raildo@lsd.ufcg.edu.br>
+Co-Authored-By: Sajeesh CS <sajeesh.cs@cern.ch>
+Co-Authored-By: Vilobh Meshram <vilobhmm@yahoo-inc.com>
+
+Implements:  bp nested-quota-driver-api
+
+Change-Id: I18ce5dce266bfc0fd6d3019dc572bf82d6e02cdc
+---
+ nova/api/openstack/compute/quota_sets.py           | 270 ++++++++++++++++++++-
+ nova/db/api.py                                     |  18 +-
+ nova/quota.py                                      |   1 -
+ .../functional/api_sample_tests/test_quota_sets.py |  60 ++++-
+ .../unit/api/openstack/compute/test_quotas.py      | 253 +++++++++++++++++++
+ nova/tests/unit/test_quota.py                      |  18 +-
+ 6 files changed, 589 insertions(+), 31 deletions(-)
+
+diff --git a/nova/api/openstack/compute/quota_sets.py b/nova/api/openstack/compute/quota_sets.py
+index e676088..7c247f0 100644
+--- a/nova/api/openstack/compute/quota_sets.py
++++ b/nova/api/openstack/compute/quota_sets.py
+@@ -13,6 +13,7 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ 
++from keystoneclient import exceptions as ksc_exceptions
+ from oslo_utils import strutils
+ import six
+ import six.moves.urllib.parse as urlparse
+@@ -22,14 +23,20 @@ from nova.api.openstack.compute.schemas import quota_sets
+ from nova.api.openstack import extensions
+ from nova.api.openstack import wsgi
+ from nova.api import validation
++from nova.db.sqlalchemy import api as sqlalchemy_api
++
++from nova import context
++from nova import db
+ from nova import exception
+ from nova.i18n import _
+ from nova import objects
+ from nova import quota
++from nova import utils
+ 
+ 
+ ALIAS = "os-quota-sets"
+ QUOTAS = quota.QUOTAS
++HIERARCHY = context.HIERARCHY
+ authorize = extensions.os_compute_authorizer(ALIAS)
+ 
+ 
+@@ -47,6 +54,32 @@ class QuotaSetsController(wsgi.Controller):
+                 result[resource] = quota_set[resource]
+         return dict(quota_set=result)
+ 
++    def _validate_quota_hierarchy(self, quota, key, project_quotas=None,
++                                  parent_project_quotas=None):
++        limit = utils.validate_integer(quota[key], key, min_value=-1,
++                                       max_value=db.MAX_INT)
++        # NOTE: -1 is a flag value for unlimited
++        if limit < -1:
++            msg = (_("Quota limit %(limit)s for %(key)s "
++                     "must be -1 or greater.") %
++                   {'limit': limit, 'key': key})
++            raise webob.exc.HTTPBadRequest(explanation=msg)
++
++        if parent_project_quotas:
++            free_quota = (parent_project_quotas[key]['limit'] -
++                          parent_project_quotas[key]['in_use'] -
++                          parent_project_quotas[key]['reserved'] -
++                          parent_project_quotas[key]['allocated'])
++
++            current = 0
++            if project_quotas.get(key):
++                current = project_quotas[key]['limit']
++
++            if limit - current > free_quota:
++                msg = _("Free quota available is %s.") % free_quota
++                raise webob.exc.HTTPBadRequest(explanation=msg)
++        return limit
++
+     def _validate_quota_limit(self, resource, limit, minimum, maximum):
+         # NOTE: -1 is a flag value for unlimited
+         if limit < -1:
+@@ -85,14 +118,110 @@ class QuotaSetsController(wsgi.Controller):
+         else:
+             return {k: v['limit'] for k, v in values.items()}
+ 
+-    @extensions.expected_errors(())
++    def _assert_not_descendant(self, target_project_id, subtree):
++        if subtree:
++            for key, value in subtree.items():
++                if key == target_project_id:
++                    return
++                self._assert_not_descendant(target_project_id, value)
++            msg = _("Show operations can only be made to projects "
++                    "in the same hierarchy of the project in "
++                    "which users are scoped to.")
++            raise webob.exc.HTTPForbidden(explanation=msg)
++
++    def _authorize_update_or_delete(self, context_project,
++                                    target_project_id,
++                                    parent_id):
++        """Checks if update or delete are allowed in the current hierarchy.
++
++        With hierarchical projects, only the admin of the parent or the root
++        project has privilege to perform quota update and delete operations.
++
++        :param context_project: The project in which the user is scoped to.
++        :param target_project_id: The id of the project in which the
++                                  user wants to perform an update or
++                                  delete operation.
++        :param parent_id: The parent id of the project in which the user
++                          wants to perform an update or delete operation.
++        """
++        if context_project.parent_id and parent_id != context_project.id:
++            msg = _("Update and delete quota operations can only be made "
++                    "by an admin of immediate parent or by the CLOUD admin.")
++            raise webob.exc.HTTPForbidden(explanation=msg)
++
++        if context_project.id != target_project_id:
++            self._assert_not_descendant(target_project_id,
++                                       context_project.subtree)
++        else:
++            msg = _("Update and delete quota operations can only be made "
++                    "by an admin of immediate parent or by the CLOUD admin.")
++            raise webob.exc.HTTPForbidden(explanation=msg)
++
++    def _authorize_show(self, context_project, target_project):
++        """Checks if show is allowed in the current hierarchy.
++
++        With hierarchical projects, are allowed to perform quota show operation
++        users with admin role in, at least, one of the following projects: the
++        current project; the immediate parent project; or the root project.
++
++        :param context_project: The project in which the user
++                                is scoped to.
++        :param target_project: The project in which the user wants
++                               to perform a show operation.
++        """
++        if target_project.parent_id:
++            if target_project.id != context_project.id:
++                self._assert_not_descendant(target_project.id,
++                                            context_project.subtree)
++                if context_project.id != target_project.parent_id:
++                    if context_project.parent_id:
++                        msg = _("Only users with token scoped to target "
++                                "project %(target)s, immediate parent "
++                                "%(parent)s or root project are allowed to "
++                                "perform this operation.") % {
++                                    'target': target_project.id,
++                                    'parent': context_project.parent_id}
++                        raise webob.exc.HTTPForbidden(explanation=msg)
++        elif context_project.parent_id:
++            msg = _("A user with a token scoped to a subproject is not "
++                    "allowed to see the quota of its parents.")
++            raise webob.exc.HTTPForbidden(explanation=msg)
++
++    @extensions.expected_errors(403)
+     def show(self, req, id):
++        """Show quota for a particular tenant
++
++        For hierarchical projects admin of current project, immediate
++        parent of the project or the cloud admin are able to perform
++        a show.
++
++        :param req: request
++        :param id: target project id that needs to be updated
++        :returns: quota information for a especific project
++        """
+         context = req.environ['nova.context']
+         authorize(context, action='show', target={'project_id': id})
+         params = urlparse.parse_qs(req.environ.get('QUERY_STRING', ''))
+         user_id = params.get('user_id', [None])[0]
+-        return self._format_quota_set(id,
+-            self._get_quotas(context, id, user_id=user_id))
++        target_project_id = id
++
++        try:
++            context_project = HIERARCHY.get_project(context,
++                                                    context.project_id,
++                                                    subtree=True)
++            target_project = HIERARCHY.get_project(context, target_project_id)
++
++            self._authorize_show(context_project, target_project)
++            parent_project_id = target_project.parent_id
++        except ksc_exceptions.Forbidden:
++            # NOTE(ericksonsantos): Keystone API v2 requires admin permissions
++            # for project_get method. We ignore Forbidden exception for
++            # non-admin users.
++            parent_project_id = None
++
++        quotas = self._get_quotas(context, target_project_id, user_id=user_id,
++            parent_project_id=parent_project_id)
++        return self._format_quota_set(target_project_id, quotas)
+ 
+     @extensions.expected_errors(())
+     def detail(self, req, id):
+@@ -103,24 +232,58 @@ class QuotaSetsController(wsgi.Controller):
+                                                            user_id=user_id,
+                                                            usages=True))
+ 
+-    @extensions.expected_errors(400)
++    @extensions.expected_errors((400, 403))
+     @validation.schema(quota_sets.update)
+     def update(self, req, id, body):
++        """Update Quota for a particular tenant
++
++        For hierarchical projects only immediate parent admin or the
++        cloud admin are able to perform an update.
++
++        :param req: request
++        :param id: target project id that needs to be updated
++        :param body: key, value pair that that will be
++                     applied to the resources if the update
++                     succeeds
++        """
+         context = req.environ['nova.context']
+         authorize(context, action='update', target={'project_id': id})
+-        project_id = id
++        target_project_id = id
+         params = urlparse.parse_qs(req.environ.get('QUERY_STRING', ''))
+         user_id = params.get('user_id', [None])[0]
+ 
+         quota_set = body['quota_set']
+         force_update = strutils.bool_from_string(quota_set.get('force',
+                                                                'False'))
+-        settable_quotas = QUOTAS.get_settable_quotas(context, project_id,
++
++        # Get the parent_id of the target project to verify whether we are
++        # dealing with hierarchical namespace or non-hierarchical namespace.
++        target_project = HIERARCHY.get_project(context, target_project_id)
++        parent_project_id = target_project.parent_id
++
++        if parent_project_id:
++            # Get the children of the project which the token is scoped to in
++            # order to know if the target_project is in its hierarchy.
++            context_project = HIERARCHY.get_project(context,
++                                                   context.project_id,
++                                                   subtree=True)
++            self._authorize_update_or_delete(context_project,
++                                             target_project.id,
++                                             parent_project_id)
++            parent_project_quotas = QUOTAS.get_project_quotas(
++                context, parent_project_id,
++                parent_project_id=parent_project_id)
++
++        settable_quotas = QUOTAS.get_settable_quotas(context,
++                                                     target_project_id,
+                                                      user_id=user_id)
+ 
+         # NOTE(dims): Pass #1 - In this loop for quota_set.items(), we validate
+         # min/max values and bail out if any of the items in the set is bad.
+         valid_quotas = {}
++        allocated_quotas = {}
++        quota_values = QUOTAS.get_project_quotas(context, target_project_id,
++                                                 defaults=False)
+         for key, value in six.iteritems(body['quota_set']):
+             if key == 'force' or (not value and value != 0):
+                 continue
+@@ -132,6 +295,14 @@ class QuotaSetsController(wsgi.Controller):
+                 minimum = settable_quotas[key]['minimum']
+                 maximum = settable_quotas[key]['maximum']
+                 self._validate_quota_limit(key, value, minimum, maximum)
++
++            if parent_project_id:
++                value = self._validate_quota_hierarchy(body['quota_set'], key,
++                                               quota_values,
++                                               parent_project_quotas)
++                allocated_quotas[key] = (
++                    parent_project_quotas[key].get('allocated', 0) + value)
++
+             valid_quotas[key] = value
+ 
+         # NOTE(dims): Pass #2 - At this point we know that all the
+@@ -140,21 +311,42 @@ class QuotaSetsController(wsgi.Controller):
+         # the validation up front in the loop above.
+         for key, value in valid_quotas.items():
+             try:
+-                objects.Quotas.create_limit(context, project_id,
++                objects.Quotas.create_limit(context, target_project_id,
+                                             key, value, user_id=user_id)
+             except exception.QuotaExists:
+-                objects.Quotas.update_limit(context, project_id,
++                objects.Quotas.update_limit(context, target_project_id,
+                                             key, value, user_id=user_id)
++        # TODO(raildo): For now we update child's quota first and then parents
++        # quota. In future this needs to be an atomic operation.
++        if parent_project_id:
++            if key in allocated_quotas.keys():
++                try:
++                    sqlalchemy_api.quota_allocated_update(
++                        context, parent_project_id, key, allocated_quotas[key])
++                except exception.ProjectQuotaNotFound:
++                    parent_limit = parent_project_quotas[key]['limit']
++                    sqlalchemy_api.quota_create(
++                        context, parent_project_id, key, parent_limit,
++                        allocated=allocated_quotas[key])
++
+         # Note(gmann): Removed 'id' from update's response to make it same
+         # as V2. If needed it can be added with microversion.
+-        return self._format_quota_set(None, self._get_quotas(context, id,
++        return self._format_quota_set(None, self._get_quotas(context,
++                                                             target_project_id,
+                                                              user_id=user_id))
+ 
+     @extensions.expected_errors(())
+     def defaults(self, req, id):
+         context = req.environ['nova.context']
+         authorize(context, action='defaults', target={'project_id': id})
+-        parent_project_id = None
++        try:
++            project = HIERARCHY.get_project(context, id)
++            parent_project_id = project.parent_id
++        except ksc_exceptions.Forbidden:
++            # NOTE(ericksonsantos): Keystone API v2 requires admin permissions
++            # for project_get method. We ignore Forbidden exception for
++            # non-admin users.
++            parent_project_id = None
+         values = QUOTAS.get_defaults(
+             context, parent_project_id=parent_project_id)
+         return self._format_quota_set(id, values)
+@@ -162,14 +354,68 @@ class QuotaSetsController(wsgi.Controller):
+     # TODO(oomichi): Here should be 204(No Content) instead of 202 by v2.1
+     # +microversions because the resource quota-set has been deleted completely
+     # when returning a response.
+-    @extensions.expected_errors(())
++    @extensions.expected_errors(403)
+     @wsgi.response(202)
+     def delete(self, req, id):
++        """Delete Quota for a particular tenant.
++
++        For hierarchical projects only immediate parent admin or the
++        cloud admin are able to perform a delete.
++
++        :param req: request
++        :param id: target project id that needs to be updated
++        """
+         context = req.environ['nova.context']
+         authorize(context, action='delete', target={'project_id': id})
++        # Get the parent_id of the target project to verify whether we are
++        # dealing with hierarchical namespace or non-hierarchical namespace.
++        target_project = HIERARCHY.get_project(context, id)
++        parent_id = target_project.parent_id
+         params = urlparse.parse_qs(req.environ.get('QUERY_STRING', ''))
+         user_id = params.get('user_id', [None])[0]
+-        if user_id:
++        try:
++            project_quotas = QUOTAS.get_project_quotas(
++                context, target_project.id, usages=True,
++                parent_project_id=parent_id, defaults=False)
++        except exception.NotAuthorized:
++            raise webob.exc.HTTPForbidden()
++
++        # If the project which is being deleted has allocated part of its quota
++        # to its subprojects, then subprojects' quotas should be deleted first.
++        for key, value in project_quotas.items():
++                if 'allocated' in project_quotas[key].keys():
++                    if project_quotas[key]['allocated'] != 0:
++                        msg = _("Cannot delete a project quota that have "
++                                "quota allocated to supbrojects. Delete the "
++                                "subprojects quota first.")
++                        raise webob.exc.HTTPBadRequest(explanation=msg)
++
++        if parent_id:
++            # Get the children of the project which the token is scoped to in
++            # order to know if the target_project is in its hierarchy.
++            context_project = HIERARCHY.get_project(context,
++                                                   context.project_id,
++                                                   subtree=True)
++            self._authorize_update_or_delete(context_project,
++                                             target_project.id,
++                                             parent_id)
++            parent_project_quotas = QUOTAS.get_project_quotas(
++                context, parent_id, parent_project_id=parent_id)
++
++            # Delete child quota first and later update parent's quota.
++            try:
++                QUOTAS.destroy_all_by_project(context, target_project.id)
++            except exception.AdminRequired:
++                raise webob.exc.HTTPForbidden()
++
++            # Update the allocated of the parent
++            for key, value in project_quotas.items():
++                project_hard_limit = project_quotas[key]['limit']
++                parent_allocated = parent_project_quotas[key]['allocated']
++                parent_allocated -= project_hard_limit
++                sqlalchemy_api.quota_allocated_update(context, parent_id, key,
++                                                      parent_allocated)
++        elif user_id:
+             QUOTAS.destroy_all_by_project_and_user(context,
+                                                    id, user_id)
+         else:
+diff --git a/nova/db/api.py b/nova/db/api.py
+index e156436..25830be 100644
+--- a/nova/db/api.py
++++ b/nova/db/api.py
+@@ -1050,6 +1050,18 @@ def quota_get_all(context, project_id):
+     return IMPL.quota_get_all(context, project_id)
+ 
+ 
++def quota_allocated_get_all_by_project(context, project_id):
++    """Retrieve all allocated quotas associated with a given project."""
++    return IMPL.quota_allocated_get_all_by_project(context, project_id)
++
++
++def quota_allocated_update(context, project_id,
++                                   resource, allocated):
++    """Update allocated quota to subprojects or raise if it does not exist."""
++    return IMPL.quota_allocated_update(context, project_id,
++                                       resource, allocated)
++
++
+ def quota_update(context, project_id, resource, limit, user_id=None):
+     """Update a quota or raise if it does not exist."""
+     return IMPL.quota_update(context, project_id, resource, limit,
+@@ -1061,12 +1073,6 @@ def get_all_quota_allocated_by_project(context, project_id):
+     return IMPL.get_all_quota_allocated_by_project(context, project_id)
+ 
+ 
+-def quota_allocated_update(context, project_id, resource, allocated):
+-    """Update allocated quota to subprojects or raise if it does not exist."""
+-    return IMPL.quota_allocated_update(context, project_id, resource,
+-                                       allocated)
+-
+-
+ ###################
+ 
+ 
+diff --git a/nova/quota.py b/nova/quota.py
+index 2d6aec2..9e19c77 100644
+--- a/nova/quota.py
++++ b/nova/quota.py
+@@ -134,7 +134,6 @@ class DbQuotaDriver(object):
+         :param parent_project_id: The id of the current project's parent,
+                                   if any.
+         """
+-
+         quotas = {}
+         default_quotas = {}
+         if not parent_project_id:
+diff --git a/nova/tests/functional/api_sample_tests/test_quota_sets.py b/nova/tests/functional/api_sample_tests/test_quota_sets.py
+index 08ff69b..dabe213 100644
+--- a/nova/tests/functional/api_sample_tests/test_quota_sets.py
++++ b/nova/tests/functional/api_sample_tests/test_quota_sets.py
+@@ -13,9 +13,12 @@
+ #    License for the specific language governing permissions and limitations
+ #    under the License.
+ 
+-from oslo_config import cfg
++import mock
++import uuid
+ 
++from nova import context
+ from nova.tests.functional.api_sample_tests import api_sample_base
++from oslo_config import cfg
+ 
+ CONF = cfg.CONF
+ CONF.import_opt('osapi_compute_extension',
+@@ -26,6 +29,17 @@ class QuotaSetsSampleJsonTests(api_sample_base.ApiSampleTestBaseV21):
+     ADMIN_API = True
+     extension_name = "os-quota-sets"
+ 
++    def setUp(self):
++        super(QuotaSetsSampleJsonTests, self).setUp()
++        self._create_project_hierarchy()
++
++    class FakeProject(object):
++
++        def __init__(self, id='foo', parent_id=None):
++            self.id = id
++            self.parent_id = parent_id
++            self.subtree = None
++
+     def _get_flags(self):
+         f = super(QuotaSetsSampleJsonTests, self)._get_flags()
+         f['osapi_compute_extension'] = CONF.osapi_compute_extension[:]
+@@ -40,18 +54,52 @@ class QuotaSetsSampleJsonTests(api_sample_base.ApiSampleTestBaseV21):
+                                     'contrib.user_quotas.User_quotas')
+         return f
+ 
++    def _create_project_hierarchy(self):
++        """Sets an environment used for nested quotas tests.
++        Create a project hierarchy such as follows:
++        +-----------+
++        |           |
++        |     A     |
++        |    / \    |
++        |   B   C   |
++        |  /        |
++        | D         |
++        +-----------+
++        """
++        self.A = self.FakeProject(id=uuid.uuid4().hex, parent_id=None)
++        self.B = self.FakeProject(id=uuid.uuid4().hex, parent_id=self.A.id)
++        self.C = self.FakeProject(id=uuid.uuid4().hex, parent_id=self.A.id)
++        self.D = self.FakeProject(id=uuid.uuid4().hex, parent_id=self.B.id)
++
++        # update projects subtrees
++        self.B.subtree = {self.D.id: self.D.subtree}
++        self.A.subtree = {self.B.id: self.B.subtree, self.C.id: self.C.subtree}
++
++        # project_by_id attribute is used to recover a project based on its id.
++        self.project_by_id = {self.A.id: self.A, self.B.id: self.B,
++                              self.C.id: self.C, self.D.id: self.D}
++
++    def get_project(self, context, id, subtree=False):
++        return self.project_by_id.get(id, self.FakeProject())
++
+     def test_show_quotas(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         # Get api sample to show quotas.
+         response = self._do_get('os-quota-sets/fake_tenant')
+         self._verify_response('quotas-show-get-resp', {}, response, 200)
+ 
+     def test_show_quotas_defaults(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         # Get api sample to show quotas defaults.
+         response = self._do_get('os-quota-sets/fake_tenant/defaults')
+         self._verify_response('quotas-show-defaults-get-resp',
+                               {}, response, 200)
+ 
+     def test_update_quotas(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         # Get api sample to update quotas.
+         response = self._do_put('os-quota-sets/fake_tenant',
+                                 'quotas-update-post-req',
+@@ -59,12 +107,16 @@ class QuotaSetsSampleJsonTests(api_sample_base.ApiSampleTestBaseV21):
+         self._verify_response('quotas-update-post-resp', {}, response, 200)
+ 
+     def test_delete_quotas(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         # Get api sample to delete quota.
+         response = self._do_delete('os-quota-sets/fake_tenant')
+         self.assertEqual(202, response.status_code)
+         self.assertEqual('', response.content)
+ 
+     def test_update_quotas_force(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         # Get api sample to update quotas.
+         response = self._do_put('os-quota-sets/fake_tenant',
+                                 'quotas-update-force-post-req',
+@@ -73,16 +125,22 @@ class QuotaSetsSampleJsonTests(api_sample_base.ApiSampleTestBaseV21):
+                                      response, 200)
+ 
+     def test_show_quotas_for_user(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         # Get api sample to show quotas for user.
+         response = self._do_get('os-quota-sets/fake_tenant?user_id=1')
+         self._verify_response('user-quotas-show-get-resp', {}, response, 200)
+ 
+     def test_delete_quotas_for_user(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         response = self._do_delete('os-quota-sets/fake_tenant?user_id=1')
+         self.assertEqual(202, response.status_code)
+         self.assertEqual('', response.content)
+ 
+     def test_update_quotas_for_user(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         # Get api sample to update quotas for user.
+         response = self._do_put('os-quota-sets/fake_tenant?user_id=1',
+                                 'user-quotas-update-post-req',
+diff --git a/nova/tests/unit/api/openstack/compute/test_quotas.py b/nova/tests/unit/api/openstack/compute/test_quotas.py
+index 019de21..45326c3 100644
+--- a/nova/tests/unit/api/openstack/compute/test_quotas.py
++++ b/nova/tests/unit/api/openstack/compute/test_quotas.py
+@@ -17,11 +17,13 @@
+ import copy
+ 
+ import mock
++import uuid
+ import webob
+ 
+ from nova.api.openstack.compute.legacy_v2.contrib import quotas as quotas_v2
+ from nova.api.openstack.compute import quota_sets as quotas_v21
+ from nova.api.openstack import extensions
++from nova import context
+ from nova import db
+ from nova import exception
+ from nova import quota
+@@ -44,6 +46,13 @@ def quota_set(id, include_server_group_quotas=True):
+ 
+ class BaseQuotaSetsTest(test.TestCase):
+ 
++    class FakeProject(object):
++
++        def __init__(self, id='foo', parent_id=None):
++            self.id = id
++            self.parent_id = parent_id
++            self.subtree = None
++
+     def _is_v20_api_test(self):
+         # NOTE(oomichi): If a test is for v2.0 API, this method returns
+         # True. Otherwise(v2.1 API test), returns False.
+@@ -68,8 +77,37 @@ class BaseQuotaSetsTest(test.TestCase):
+             # method instead of status_int in a response object.
+             return self.controller.delete.wsgi_code
+ 
++    def _create_project_hierarchy(self):
++        """Sets an environment used for nested quotas tests.
++        Create a project hierarchy such as follows:
++        +-----------+
++        |           |
++        |     A     |
++        |    / \    |
++        |   B   C   |
++        |  /        |
++        | D         |
++        +-----------+
++        """
++        self.A = self.FakeProject(id=uuid.uuid4().hex, parent_id=None)
++        self.B = self.FakeProject(id=uuid.uuid4().hex, parent_id=self.A.id)
++        self.C = self.FakeProject(id=uuid.uuid4().hex, parent_id=self.A.id)
++        self.D = self.FakeProject(id=uuid.uuid4().hex, parent_id=self.B.id)
++
++        # update projects subtrees
++        self.B.subtree = {self.D.id: self.D.subtree}
++        self.A.subtree = {self.B.id: self.B.subtree, self.C.id: self.C.subtree}
++
++        # project_by_id attribute is used to recover a project based on its id.
++        self.project_by_id = {self.A.id: self.A, self.B.id: self.B,
++                              self.C.id: self.C, self.D.id: self.D}
++
++    def get_project(self, context, id, subtree=False):
++        return self.project_by_id.get(id, self.FakeProject())
++
+ 
+ class QuotaSetsTestV21(BaseQuotaSetsTest):
++
+     plugin = quotas_v21
+     validation_error = exception.ValidationError
+     include_server_group_quotas = True
+@@ -94,6 +132,7 @@ class QuotaSetsTestV21(BaseQuotaSetsTest):
+         if self.include_server_group_quotas:
+             self.default_quotas['server_groups'] = 10
+             self.default_quotas['server_group_members'] = 10
++        self._create_project_hierarchy()
+ 
+     def _setup_controller(self):
+         self.ext_mgr = self.mox.CreateMock(extensions.ExtensionManager)
+@@ -174,6 +213,8 @@ class QuotaSetsTestV21(BaseQuotaSetsTest):
+                           resource, db.MAX_INT + 1, -1, -1)
+ 
+     def test_quotas_defaults(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         uri = '/v2/fake_tenant/os-quota-sets/fake_tenant/defaults'
+ 
+         req = fakes.HTTPRequest.blank(uri)
+@@ -184,6 +225,8 @@ class QuotaSetsTestV21(BaseQuotaSetsTest):
+         self.assertEqual(res_dict, expected)
+ 
+     def test_quotas_show(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         self.setup_mock_for_show()
+         req = self._get_http_request()
+         res_dict = self.controller.show(req, 1234)
+@@ -192,6 +235,8 @@ class QuotaSetsTestV21(BaseQuotaSetsTest):
+         self.assertEqual(res_dict, ref_quota_set)
+ 
+     def test_quotas_update(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         self.setup_mock_for_update()
+         self.default_quotas.update({
+             'instances': 50,
+@@ -204,6 +249,8 @@ class QuotaSetsTestV21(BaseQuotaSetsTest):
+ 
+     @mock.patch('nova.objects.Quotas.create_limit')
+     def test_quotas_update_with_good_data(self, mock_createlimit):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         self.setup_mock_for_update()
+         self.default_quotas.update({})
+         body = {'quota_set': self.default_quotas}
+@@ -216,6 +263,8 @@ class QuotaSetsTestV21(BaseQuotaSetsTest):
+     @mock.patch('nova.objects.Quotas.create_limit')
+     def test_quotas_update_with_bad_data(self, mock_createlimit,
+                                                   mock_validate):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         self.setup_mock_for_update()
+         self.default_quotas.update({
+             'instances': 50,
+@@ -229,6 +278,8 @@ class QuotaSetsTestV21(BaseQuotaSetsTest):
+                          len(mock_createlimit.mock_calls))
+ 
+     def test_quotas_update_zero_value(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         self.setup_mock_for_update()
+         body = {'quota_set': {'instances': 0, 'cores': 0,
+                               'ram': 0, 'floating_ips': 0,
+@@ -248,6 +299,8 @@ class QuotaSetsTestV21(BaseQuotaSetsTest):
+         self.assertEqual(body, res_dict)
+ 
+     def _quotas_update_bad_request_case(self, body):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         self.setup_mock_for_update()
+         req = self._get_http_request()
+         self.assertRaises(self.validation_error, self.controller.update,
+@@ -296,6 +349,8 @@ class QuotaSetsTestV21(BaseQuotaSetsTest):
+         self._quotas_update_bad_request_case(body)
+ 
+     def test_quotas_delete(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         if self._is_v20_api_test():
+             self.ext_mgr.is_loaded('os-extended-quotas').AndReturn(True)
+         req = self._get_http_request()
+@@ -316,6 +371,7 @@ class ExtendedQuotasTestV21(BaseQuotaSetsTest):
+         super(ExtendedQuotasTestV21, self).setUp()
+         self._setup_controller()
+         self.setup_mock_for_update()
++        self._create_project_hierarchy()
+ 
+     fake_quotas = {'ram': {'limit': 51200,
+                            'in_use': 12800,
+@@ -354,6 +410,8 @@ class ExtendedQuotasTestV21(BaseQuotaSetsTest):
+         return fakes.HTTPRequest.blank(url)
+ 
+     def test_quotas_update_exceed_in_used(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         patcher = mock.patch.object(quota.QUOTAS, 'get_settable_quotas')
+         get_settable_quotas = patcher.start()
+ 
+@@ -366,6 +424,8 @@ class ExtendedQuotasTestV21(BaseQuotaSetsTest):
+         mock.patch.stopall()
+ 
+     def test_quotas_force_update_exceed_in_used(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         patcher = mock.patch.object(quota.QUOTAS, 'get_settable_quotas')
+         get_settable_quotas = patcher.start()
+         patcher = mock.patch.object(self.plugin.QuotaSetsController,
+@@ -382,6 +442,8 @@ class ExtendedQuotasTestV21(BaseQuotaSetsTest):
+ 
+     @mock.patch('nova.objects.Quotas.create_limit')
+     def test_quotas_update_good_data(self, mock_createlimit):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         body = {'quota_set': {'cores': 1,
+                               'instances': 1}}
+         req = fakes.HTTPRequest.blank('/v2/fake4/os-quota-sets/update_me',
+@@ -392,6 +454,8 @@ class ExtendedQuotasTestV21(BaseQuotaSetsTest):
+ 
+     @mock.patch('nova.objects.Quotas.create_limit')
+     def test_quotas_update_bad_data(self, mock_createlimit):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         patcher = mock.patch.object(quota.QUOTAS, 'get_settable_quotas')
+         get_settable_quotas = patcher.start()
+ 
+@@ -415,6 +479,7 @@ class UserQuotasTestV21(BaseQuotaSetsTest):
+     def setUp(self):
+         super(UserQuotasTestV21, self).setUp()
+         self._setup_controller()
++        self._create_project_hierarchy()
+ 
+     def _get_http_request(self, url=''):
+         return fakes.HTTPRequest.blank(url)
+@@ -423,8 +488,13 @@ class UserQuotasTestV21(BaseQuotaSetsTest):
+         self.ext_mgr = self.mox.CreateMock(extensions.ExtensionManager)
+         self.controller = self.plugin.QuotaSetsController(self.ext_mgr)
+ 
++    def get_project(self, context, id, subtree=False):
++        return self.project_by_id.get(id, self.FakeProject())
++
+     def test_user_quotas_show(self):
+         self.setup_mock_for_show()
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         req = self._get_http_request('/v2/fake4/os-quota-sets/1234?user_id=1')
+         res_dict = self.controller.show(req, 1234)
+         ref_quota_set = quota_set('1234', self.include_server_group_quotas)
+@@ -432,6 +502,8 @@ class UserQuotasTestV21(BaseQuotaSetsTest):
+ 
+     def test_user_quotas_update(self):
+         self.setup_mock_for_update()
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         body = {'quota_set': {'instances': 10, 'cores': 20,
+                               'ram': 51200, 'floating_ips': 10,
+                               'fixed_ips': -1, 'metadata_items': 128,
+@@ -453,6 +525,8 @@ class UserQuotasTestV21(BaseQuotaSetsTest):
+ 
+     def test_user_quotas_update_exceed_project(self):
+         self.setup_mock_for_update()
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         body = {'quota_set': {'instances': 20}}
+ 
+         url = '/v2/fake4/os-quota-sets/update_me?user_id=1'
+@@ -461,6 +535,8 @@ class UserQuotasTestV21(BaseQuotaSetsTest):
+                           req, 'update_me', body=body)
+ 
+     def test_user_quotas_delete(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         if self._is_v20_api_test():
+             self.ext_mgr.is_loaded('os-extended-quotas').AndReturn(True)
+             self.ext_mgr.is_loaded('os-user-quotas').AndReturn(True)
+@@ -477,6 +553,8 @@ class UserQuotasTestV21(BaseQuotaSetsTest):
+ 
+     @mock.patch('nova.objects.Quotas.create_limit')
+     def test_user_quotas_update_good_data(self, mock_createlimit):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         self.setup_mock_for_update()
+         body = {'quota_set': {'instances': 1,
+                               'cores': 1}}
+@@ -489,6 +567,8 @@ class UserQuotasTestV21(BaseQuotaSetsTest):
+ 
+     @mock.patch('nova.objects.Quotas.create_limit')
+     def test_user_quotas_update_bad_data(self, mock_createlimit):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
+         self.setup_mock_for_update()
+         body = {'quota_set': {'instances': 20,
+                               'cores': 1}}
+@@ -512,6 +592,7 @@ class QuotaSetsTestV2(QuotaSetsTestV21):
+         self.mox.ReplayAll()
+         self.controller = self.plugin.QuotaSetsController(self.ext_mgr)
+         self.mox.ResetAll()
++        self._create_project_hierarchy()
+ 
+     def _get_http_request(self, url=''):
+         return fakes.HTTPRequest.blank(url, use_admin_context=True)
+@@ -624,11 +705,183 @@ class ExtendedQuotasTestV2(ExtendedQuotasTestV21):
+         self.mox.ReplayAll()
+         self.controller = self.plugin.QuotaSetsController(self.ext_mgr)
+         self.mox.ResetAll()
++        self._create_project_hierarchy()
+ 
+     def _get_http_request(self, url=''):
+         return fakes.HTTPRequest.blank(url, use_admin_context=True)
+ 
+ 
++class HierarchicalQuotasTestV21(QuotaSetsTestV21):
++
++    def setUp(self):
++        super(HierarchicalQuotasTestV21, self).setUp()
++        self.default_subproject_quotas = (
++            {k: 0 for k, v in self.default_quotas.items()})
++        self._create_project_hierarchy()
++
++    def test_quotas_subproject_defaults(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
++        uri = '/v2/%s/os-quota-sets/%s/defaults' % (self.A.id, self.B.id)
++
++        req = fakes.HTTPRequest.blank(uri)
++        res_dict = self.controller.defaults(req, self.B.id)
++        self.default_subproject_quotas.update({'id': self.B.id})
++        expected = {'quota_set': self.default_subproject_quotas}
++
++        self.assertEqual(res_dict, expected)
++
++    def test_show_quotas_subproject(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
++        req = self._get_http_request()
++        req.environ['nova.context'].project_id = self.A.id
++        res_dict = self.controller.show(req, self.B.id)
++        self.default_subproject_quotas.update({'id': self.B.id})
++        expected = {'quota_set': self.default_subproject_quotas}
++        self.assertEqual(res_dict, expected)
++
++    def test_child_project_cannot_show_parent_quota(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
++        req = self._get_http_request()
++        req.environ['nova.context'].project_id = self.B.id
++        self.assertRaises(webob.exc.HTTPForbidden,
++                          self.controller.show,
++                          req, self.A.id)
++
++        # Not a immediate child trying get the quota for A
++        req.environ['nova.context'].project_id = self.C.id
++        self.assertRaises(webob.exc.HTTPForbidden,
++                          self.controller.show,
++                          req, self.A.id)
++
++        # Immediate child trying get the quota for non-root parent project
++        req.environ['nova.context'].project_id = self.C.id
++        self.assertRaises(webob.exc.HTTPForbidden,
++                          self.controller.show,
++                          req, self.B.id)
++
++    def test_show_quota_other_hierarchy_error(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
++        # creating a new hierarchy
++        E = self.FakeProject(id=uuid.uuid4().hex, parent_id=None)
++        F = self.FakeProject(id=uuid.uuid4().hex, parent_id=E.id)
++        self.project_by_id[E.id] = E
++        self.project_by_id[F.id] = F
++
++        req = self._get_http_request()
++        req.environ['nova.context'].project_id = self.A.id
++        self.assertRaises(webob.exc.HTTPForbidden,
++                          self.controller.show,
++                          req, F.id)
++
++    def test_quotas_subproject_update(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
++        req = self._get_http_request()
++        req.environ['nova.context'].project_id = self.A.id
++        self.default_subproject_quotas.update({
++            'instances': 50,
++            'cores': 50
++        })
++        body = {'quota_set': self.default_subproject_quotas}
++        self.controller.update(req, self.A.id, body=body)
++        res_dict = self.controller.update(req, self.B.id, body=body)
++        self.assertEqual(body, res_dict)
++
++    def test_update_quota_in_other_hierarchy_error(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
++        req = self._get_http_request()
++        req.environ['nova.context'].project_id = self.A.id
++        # creating a new hierarchy
++        E = self.FakeProject(id=uuid.uuid4().hex, parent_id=None)
++        F = self.FakeProject(id=uuid.uuid4().hex, parent_id=E.id)
++        self.project_by_id[E.id] = E
++        self.project_by_id[F.id] = F
++
++        self.default_subproject_quotas.update({
++            'instances': 50,
++            'cores': 50
++        })
++        body = {'quota_set': self.default_subproject_quotas}
++
++        self.assertRaises(webob.exc.HTTPForbidden,
++                          self.controller.update,
++                          req, F.id, body=body)
++
++    def test_subproject_overquota_update(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
++        req = self._get_http_request()
++        req.environ['nova.context'].project_id = self.A.id
++        self.default_subproject_quotas.update({
++            'instances': 50,
++            'cores': 50
++        })
++        body = {'quota_set': self.default_subproject_quotas}
++        self.controller.update(req, self.A.id, body=body)
++        self.default_subproject_quotas.update({
++            'instances': 60,
++            'cores': 60
++        })
++        body = {'quota_set': self.default_subproject_quotas}
++        self.assertRaises(webob.exc.HTTPBadRequest,
++                          self.controller.update,
++                          req, self.B.id, body=body)
++
++    def test_subproject_underquota_update(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
++        req = self._get_http_request()
++        req.environ['nova.context'].project_id = self.A.id
++        self.default_subproject_quotas.update({
++            'instances': 50,
++            'cores': 50
++        })
++        body = {'quota_set': self.default_subproject_quotas}
++        self.controller.update(req, self.A.id, body=body)
++        self.default_subproject_quotas.update({
++            'instances': -10,
++            'cores': -20
++        })
++        body = {'quota_set': self.default_subproject_quotas}
++        self.assertRaises(exception.ValidationError,
++                          self.controller.update,
++                          req, self.B.id, body=body)
++
++    def test_update_own_subprojct_quota(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
++        req = self._get_http_request()
++        req.environ['nova.context'].project_id = self.B.id
++        self.default_subproject_quotas.update({
++            'instances': 10,
++            'cores': 10
++        })
++        body = {'quota_set': self.default_subproject_quotas}
++        self.assertRaises(webob.exc.HTTPForbidden,
++                          self.controller.update,
++                          req, self.B.id, body=body)
++
++    def test_quotas_subproject_delete(self):
++        context.HIERARCHY.get_project = mock.Mock()
++        context.HIERARCHY.get_project.side_effect = self.get_project
++
++        req = self._get_http_request()
++        req.environ['nova.context'].project_id = self.A.id
++        self.mox.StubOutWithMock(quota.QUOTAS,
++                                 "destroy_all_by_project")
++        quota.QUOTAS.destroy_all_by_project(req.environ['nova.context'],
++                                            self.B.id)
++        self.mox.ReplayAll()
++        res = self.controller.delete(req, self.B.id)
++        self.mox.VerifyAll()
++        self.assertEqual(202, self.get_delete_status_int(res))
++
++
+ class UserQuotasTestV2(UserQuotasTestV21):
+     plugin = quotas_v2
+ 
+diff --git a/nova/tests/unit/test_quota.py b/nova/tests/unit/test_quota.py
+index e260140..4715183 100644
+--- a/nova/tests/unit/test_quota.py
++++ b/nova/tests/unit/test_quota.py
+@@ -1290,10 +1290,8 @@ class DbQuotaDriverTestCase(test.TestCase):
+             quota.QUOTAS._resources, 'test_project',
+             parent_project_id=parent_project_id)
+ 
+-        self.assertEqual(self.calls, [
+-                'quota_get_all_by_project',
+-                'quota_usage_get_all_by_project',
+-                ])
++        self.assertIn('quota_get_all_by_project', self.calls)
++        self.assertIn('quota_usage_get_all_by_project', self.calls)
+         self.assertEqual(result, dict(
+                 instances=dict(
+                     limit=0,
+@@ -1388,13 +1386,11 @@ class DbQuotaDriverTestCase(test.TestCase):
+             FakeContext('test_project', 'test_class'),
+             quota.QUOTAS._resources, 'test_project', remains=True)
+ 
+-        self.assertEqual(self.calls, [
+-                'quota_get_all_by_project',
+-                'quota_usage_get_all_by_project',
+-                'quota_class_get_all_by_name',
+-                'quota_class_get_default',
+-                'quota_get_all',
+-                ])
++        self.assertIn('quota_get_all_by_project', self.calls)
++        self.assertIn('quota_usage_get_all_by_project', self.calls)
++        self.assertIn('quota_class_get_all_by_name', self.calls)
++        self.assertIn('quota_class_get_default', self.calls)
++        self.assertIn('quota_get_all', self.calls)
+         self.assertEqual(result, dict(
+                 instances=dict(
+                     limit=5,
+-- 
+1.9.1
+

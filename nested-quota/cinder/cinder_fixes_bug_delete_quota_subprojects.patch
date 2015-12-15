@@ -1,0 +1,82 @@
+From 9a668a0a48135c423a4deda23bb161f6b917ac39 Mon Sep 17 00:00:00 2001
+From: Erickson Santos <erickson@lsd.ufcg.edu.br>
+Date: Tue, 15 Sep 2015 14:58:13 -0300
+Subject: [PATCH] Fix delete quota of subprojects
+
+This patch aims to fix the bug in which cinder raises
+an error when performing a delete quota operation in
+a subproject.
+
+Steps to reproduce:
+- Create a project A in keystone (e.g openstack project create A);
+- Create a project B in keystone with A as its parent (e.g openstack
+  project create B --property parent_id=<id of project A>);
+- Update the quota value of A (e.g. openstack quota set
+  <id of project A> --volume 5)
+- Update the quota value of B (e.g. openstack quota set
+  <id of project B> --volume 2)
+- Try to delete the quota of B (e.g. cinder quota-delete
+  <id of project B>)
+
+Change-Id: Id1a749433c3679f1b2adf87ea0a280366c5e4a15
+Closes-bug: #1496058
+---
+ cinder/api/contrib/quotas.py                 |  2 +-
+ cinder/tests/unit/api/contrib/test_quotas.py | 28 ++++++++++++++++++++++++++++
+ 2 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/cinder/api/contrib/quotas.py b/cinder/api/contrib/quotas.py
+index 27f0401..2c29a93 100644
+--- a/cinder/api/contrib/quotas.py
++++ b/cinder/api/contrib/quotas.py
+@@ -366,7 +366,7 @@ class QuotaSetsController(wsgi.Controller):
+         try:
+             project_quotas = QUOTAS.get_project_quotas(
+                 context, target_project.id, usages=True,
+-                parent_project_id=parent_id)
++                parent_project_id=parent_id, defaults=False)
+         except exception.NotAuthorized:
+             raise webob.exc.HTTPForbidden()
+ 
+diff --git a/cinder/tests/unit/api/contrib/test_quotas.py b/cinder/tests/unit/api/contrib/test_quotas.py
+index cb39108..f3c16a5 100644
+--- a/cinder/tests/unit/api/contrib/test_quotas.py
++++ b/cinder/tests/unit/api/contrib/test_quotas.py
+@@ -460,6 +460,34 @@ class QuotaSetsControllerTest(test.TestCase):
+         result_show_after = self.controller.show(self.req, self.A.id)
+         self.assertDictMatch(result_show, result_show_after)
+ 
++    def test_subproject_delete_not_considering_default_quotas(self):
++        """Test delete subprojects' quotas won't consider default quotas.
++
++        Test plan:
++        - Update the volume quotas of project A
++        - Update the volume quotas of project B
++        - Delete the quotas of project B
++
++        Resources with default quotas aren't expected to be considered when
++        updating the allocated values of the parent project. Thus, the delete
++        operation should succeed.
++        """
++        self.controller._get_project = mock.Mock()
++        self.controller._get_project.side_effect = self._get_project
++        self.req.environ['cinder.context'].project_id = self.A.id
++
++        body = {'quota_set': {'volumes': 5}}
++        result = self.controller.update(self.req, self.A.id, body)
++        self.assertEqual(body['quota_set']['volumes'],
++                         result['quota_set']['volumes'])
++
++        body = {'quota_set': {'volumes': 2}}
++        result = self.controller.update(self.req, self.B.id, body)
++        self.assertEqual(body['quota_set']['volumes'],
++                         result['quota_set']['volumes'])
++
++        self.controller.delete(self.req, self.B.id)
++
+     def test_delete_with_allocated_quota_different_from_zero(self):
+         self.controller._get_project = mock.Mock()
+         self.controller._get_project.side_effect = self._get_project
+-- 
+1.9.1
+

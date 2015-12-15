@@ -1,0 +1,504 @@
+From 828894e4daefeee4b90a4e13d5c28faf88857312 Mon Sep 17 00:00:00 2001
+From: Vilobh Meshram <vilobhmm@yahoo-inc.com>
+Date: Mon, 22 Jun 2015 14:45:02 -0700
+Subject: [PATCH] Nested Quota: Set default values to subproject
+
+In case of hierarchical projects set the default value
+(for resources who have the resource flag set) for a
+sub-project to zero. This patch adds this functionality for
+hierarchical projects, while keeping the functionality
+intact for non-hierarchical project. At the top level,
+project resources will get the default values as imposed
+by the "default" class settings.
+
+Co-Authored-By: Erickson Santos <erickson@lsd.ufcg.edu.br>
+
+Change-Id: I3b357464d5e5e0aa065506ac1e9d908e87f45c63
+Partially-Implements: bp cinder-nested-quota-driver
+---
+ cinder/api/contrib/quotas.py    |  10 ++-
+ cinder/quota.py                 |  71 ++++++++++++++-----
+ cinder/tests/unit/test_quota.py | 150 +++++++++++++++++++++++++++++++++++++---
+ 3 files changed, 199 insertions(+), 32 deletions(-)
+
+diff --git a/cinder/api/contrib/quotas.py b/cinder/api/contrib/quotas.py
+index ec05369..3089c0c 100644
+--- a/cinder/api/contrib/quotas.py
++++ b/cinder/api/contrib/quotas.py
+@@ -70,8 +70,9 @@ class QuotaSetsController(wsgi.Controller):
+ 
+         return limit
+ 
+-    def _get_quotas(self, context, id, usages=False):
+-        values = QUOTAS.get_project_quotas(context, id, usages=usages)
++    def _get_quotas(self, context, id, usages=False, parent_project_id=None):
++        values = QUOTAS.get_project_quotas(context, id, usages=usages,
++                                           parent_project_id=parent_project_id)
+ 
+         if usages:
+             return values
+@@ -146,7 +147,10 @@ class QuotaSetsController(wsgi.Controller):
+     def defaults(self, req, id):
+         context = req.environ['cinder.context']
+         authorize_show(context)
+-        return self._format_quota_set(id, QUOTAS.get_defaults(context))
++        return self._format_quota_set(id,
++                                      QUOTAS.get_defaults(context,
++                                                          parent_project_id=
++                                                          None))
+ 
+     @wsgi.serializers(xml=QuotaTemplate)
+     def delete(self, req, id):
+diff --git a/cinder/quota.py b/cinder/quota.py
+index 85e3bd4..e547d90 100644
+--- a/cinder/quota.py
++++ b/cinder/quota.py
+@@ -97,13 +97,18 @@ class DbQuotaDriver(object):
+ 
+         return db.quota_class_get(context, quota_class, resource_name)
+ 
+-    def get_default(self, context, resource):
+-        """Get a specific default quota for a resource."""
++    def get_default(self, context, resource, parent_project_id=None):
++        """Get a specific default quota for a resource.
++
++        :param parent_project_id: The id of the current project's parent,
++                                  if any.
++        """
+ 
+         default_quotas = db.quota_class_get_default(context)
+-        return default_quotas.get(resource.name, resource.default)
++        default_quota_value = 0 if parent_project_id else resource.default
++        return default_quotas.get(resource.name, default_quota_value)
+ 
+-    def get_defaults(self, context, resources):
++    def get_defaults(self, context, resources, parent_project_id=None):
+         """Given a list of resources, retrieve the default quotas.
+ 
+         Use the class quotas named `_DEFAULT_QUOTA_NAME` as default quotas,
+@@ -111,6 +116,8 @@ class DbQuotaDriver(object):
+ 
+         :param context: The request context, for access checks.
+         :param resources: A dictionary of the registered resources.
++        :param parent_project_id: The id of the current project's parent,
++                                  if any.
+         """
+ 
+         quotas = {}
+@@ -127,8 +134,8 @@ class DbQuotaDriver(object):
+                     "default quota class for default "
+                     "quota.") % {'res': resource.name})
+             quotas[resource.name] = default_quotas.get(resource.name,
+-                                                       resource.default)
+-
++                                                       (0 if parent_project_id
++                                                        else resource.default))
+         return quotas
+ 
+     def get_class_quotas(self, context, resources, quota_class,
+@@ -162,7 +169,7 @@ class DbQuotaDriver(object):
+ 
+     def get_project_quotas(self, context, resources, project_id,
+                            quota_class=None, defaults=True,
+-                           usages=True):
++                           usages=True, parent_project_id=None):
+         """Given a list of resources, retrieve the quotas for the given
+         project.
+ 
+@@ -180,6 +187,8 @@ class DbQuotaDriver(object):
+                          specific value for the resource.
+         :param usages: If True, the current in_use and reserved counts
+                        will also be returned.
++        :param parent_project_id: The id of the current project's parent,
++                                  if any.
+         """
+ 
+         quotas = {}
+@@ -199,7 +208,8 @@ class DbQuotaDriver(object):
+         else:
+             class_quotas = {}
+ 
+-        default_quotas = self.get_defaults(context, resources)
++        default_quotas = self.get_defaults(context, resources,
++                                           parent_project_id=parent_project_id)
+ 
+         for resource in resources.values():
+             # Omit default/quota class values
+@@ -224,7 +234,8 @@ class DbQuotaDriver(object):
+ 
+         return quotas
+ 
+-    def _get_quotas(self, context, resources, keys, has_sync, project_id=None):
++    def _get_quotas(self, context, resources, keys, has_sync, project_id=None,
++                    parent_project_id=None):
+         """A helper method which retrieves the quotas for specific resources.
+ 
+         This specific resource is identified by keys, and which apply to the
+@@ -240,6 +251,8 @@ class DbQuotaDriver(object):
+         :param project_id: Specify the project_id if current context
+                            is admin and admin wants to impact on
+                            common user's tenant.
++        :param parent_project_id: The id of the current project's parent,
++                                  if any.
+         """
+ 
+         # Filter resources
+@@ -259,7 +272,8 @@ class DbQuotaDriver(object):
+         # Grab and return the quotas (without usages)
+         quotas = self.get_project_quotas(context, sub_resources,
+                                          project_id,
+-                                         context.quota_class, usages=False)
++                                         context.quota_class, usages=False,
++                                         parent_project_id=parent_project_id)
+ 
+         return {k: v['limit'] for k, v in quotas.items()}
+ 
+@@ -431,17 +445,20 @@ class DbQuotaDriver(object):
+ class BaseResource(object):
+     """Describe a single resource for quota checking."""
+ 
+-    def __init__(self, name, flag=None):
++    def __init__(self, name, flag=None, parent_project_id=None):
+         """Initializes a Resource.
+ 
+         :param name: The name of the resource, i.e., "volumes".
+         :param flag: The name of the flag or configuration option
+                      which specifies the default value of the quota
+                      for this resource.
++        :param parent_project_id: The id of the current project's parent,
++                                  if any.
+         """
+ 
+         self.name = name
+         self.flag = flag
++        self.parent_project_id = parent_project_id
+ 
+     def quota(self, driver, context, **kwargs):
+         """Given a driver and context, obtain the quota for this resource.
+@@ -486,12 +503,16 @@ class BaseResource(object):
+                 pass
+ 
+         # OK, return the default
+-        return driver.get_default(context, self)
++        return driver.get_default(context, self,
++                                  parent_project_id=self.parent_project_id)
+ 
+     @property
+     def default(self):
+         """Return the default value of the quota."""
+ 
++        if self.parent_project_id:
++            return 0
++
+         return CONF[self.flag] if self.flag else -1
+ 
+ 
+@@ -628,18 +649,26 @@ class QuotaEngine(object):
+ 
+         return self._driver.get_by_class(context, quota_class, resource_name)
+ 
+-    def get_default(self, context, resource):
+-        """Get a specific default quota for a resource."""
++    def get_default(self, context, resource, parent_project_id=None):
++        """Get a specific default quota for a resource.
++
++        :param parent_project_id: The id of the current project's parent,
++                                  if any.
++        """
+ 
+-        return self._driver.get_default(context, resource)
++        return self._driver.get_default(context, resource,
++                                        parent_project_id=parent_project_id)
+ 
+-    def get_defaults(self, context):
++    def get_defaults(self, context, parent_project_id=None):
+         """Retrieve the default quotas.
+ 
+         :param context: The request context, for access checks.
++        :param parent_project_id: The id of the current project's parent,
++                                  if any.
+         """
+ 
+-        return self._driver.get_defaults(context, self.resources)
++        return self._driver.get_defaults(context, self.resources,
++                                         parent_project_id)
+ 
+     def get_class_quotas(self, context, quota_class, defaults=True):
+         """Retrieve the quotas for the given quota class.
+@@ -656,7 +685,7 @@ class QuotaEngine(object):
+                                              quota_class, defaults=defaults)
+ 
+     def get_project_quotas(self, context, project_id, quota_class=None,
+-                           defaults=True, usages=True):
++                           defaults=True, usages=True, parent_project_id=None):
+         """Retrieve the quotas for the given project.
+ 
+         :param context: The request context, for access checks.
+@@ -670,13 +699,17 @@ class QuotaEngine(object):
+                          specific value for the resource.
+         :param usages: If True, the current in_use and reserved counts
+                        will also be returned.
++        :param parent_project_id: The id of the current project's parent,
++                                  if any.
+         """
+ 
+         return self._driver.get_project_quotas(context, self.resources,
+                                                project_id,
+                                                quota_class=quota_class,
+                                                defaults=defaults,
+-                                               usages=usages)
++                                               usages=usages,
++                                               parent_project_id=
++                                               parent_project_id)
+ 
+     def count(self, context, resource, *args, **kwargs):
+         """Count a resource.
+diff --git a/cinder/tests/unit/test_quota.py b/cinder/tests/unit/test_quota.py
+index 98fb140..487c0cb 100644
+--- a/cinder/tests/unit/test_quota.py
++++ b/cinder/tests/unit/test_quota.py
+@@ -321,12 +321,14 @@ class FakeDriver(object):
+         except KeyError:
+             raise exception.QuotaClassNotFound(class_name=quota_class)
+ 
+-    def get_default(self, context, resource):
+-        self.called.append(('get_default', context, resource))
++    def get_default(self, context, resource, parent_project_id=None):
++        self.called.append(('get_default', context, resource,
++                            parent_project_id))
+         return resource.default
+ 
+-    def get_defaults(self, context, resources):
+-        self.called.append(('get_defaults', context, resources))
++    def get_defaults(self, context, resources, parent_project_id=None):
++        self.called.append(('get_defaults', context, resources,
++                            parent_project_id))
+         return resources
+ 
+     def get_class_quotas(self, context, resources, quota_class,
+@@ -336,9 +338,11 @@ class FakeDriver(object):
+         return resources
+ 
+     def get_project_quotas(self, context, resources, project_id,
+-                           quota_class=None, defaults=True, usages=True):
++                           quota_class=None, defaults=True, usages=True,
++                           parent_project_id=None):
+         self.called.append(('get_project_quotas', context, resources,
+-                            project_id, quota_class, defaults, usages))
++                            project_id, quota_class, defaults, usages,
++                            parent_project_id))
+         return resources
+ 
+     def limit_check(self, context, resources, values, project_id=None):
+@@ -443,6 +447,16 @@ class BaseResourceTestCase(test.TestCase):
+ 
+         self.assertEqual(quota_value, 20)
+ 
++    def test_quota_override_subproject_no_class(self):
++        self.flags(quota_volumes=10)
++        resource = quota.BaseResource('test_resource', 'quota_volumes',
++                                      parent_project_id='test_parent_project')
++        driver = FakeDriver()
++        context = FakeContext('test_project', None)
++        quota_value = resource.quota(driver, context)
++
++        self.assertEqual(quota_value, 0)
++
+     def test_quota_with_project_override_class(self):
+         self.flags(quota_volumes=10)
+         resource = quota.BaseResource('test_resource', 'quota_volumes')
+@@ -550,13 +564,15 @@ class QuotaEngineTestCase(test.TestCase):
+ 
+     def test_get_defaults(self):
+         context = FakeContext(None, None)
++        parent_project_id = None
+         driver = FakeDriver()
+         quota_obj = self._make_quota_obj(driver)
+         result = quota_obj.get_defaults(context)
+ 
+         self.assertEqual(driver.called, [('get_defaults',
+                                           context,
+-                                          quota_obj.resources), ])
++                                          quota_obj.resources,
++                                          parent_project_id), ])
+         self.assertEqual(result, quota_obj.resources)
+ 
+     def test_get_class_quotas(self):
+@@ -580,6 +596,7 @@ class QuotaEngineTestCase(test.TestCase):
+     def test_get_project_quotas(self):
+         context = FakeContext(None, None)
+         driver = FakeDriver()
++        parent_project_id = None
+         quota_obj = self._make_quota_obj(driver)
+         result1 = quota_obj.get_project_quotas(context, 'test_project')
+         result2 = quota_obj.get_project_quotas(context, 'test_project',
+@@ -594,14 +611,51 @@ class QuotaEngineTestCase(test.TestCase):
+              'test_project',
+              None,
+              True,
+-             True),
++             True,
++             parent_project_id),
+             ('get_project_quotas',
+              context,
+              quota_obj.resources,
+              'test_project',
+              'test_class',
+              False,
+-             False), ])
++             False,
++             parent_project_id), ])
++        self.assertEqual(result1, quota_obj.resources)
++        self.assertEqual(result2, quota_obj.resources)
++
++    def test_get_subproject_quotas(self):
++        context = FakeContext(None, None)
++        driver = FakeDriver()
++        parent_project_id = 'test_parent_project_id'
++        quota_obj = self._make_quota_obj(driver)
++        result1 = quota_obj.get_project_quotas(context, 'test_project',
++                                               parent_project_id=
++                                               parent_project_id)
++        result2 = quota_obj.get_project_quotas(context, 'test_project',
++                                               quota_class='test_class',
++                                               defaults=False,
++                                               usages=False,
++                                               parent_project_id=
++                                               parent_project_id)
++
++        self.assertEqual(driver.called, [
++            ('get_project_quotas',
++             context,
++             quota_obj.resources,
++             'test_project',
++             None,
++             True,
++             True,
++             parent_project_id),
++            ('get_project_quotas',
++             context,
++             quota_obj.resources,
++             'test_project',
++             'test_class',
++             False,
++             False,
++             parent_project_id), ])
+         self.assertEqual(result1, quota_obj.resources)
+         self.assertEqual(result2, quota_obj.resources)
+ 
+@@ -853,6 +907,25 @@ class DbQuotaDriverTestCase(test.TestCase):
+                 backup_gigabytes=1000,
+                 per_volume_gigabytes=-1))
+ 
++    def test_subproject_get_defaults(self):
++        # Test subproject default values.
++        self._stub_quota_class_get_default_subproject()
++        self._stub_volume_type_get_all()
++        parent_project_id = 'test_parent_project_id'
++        result = self.driver.get_defaults(None,
++                                          quota.QUOTAS.resources,
++                                          parent_project_id)
++
++        self.assertEqual(
++            result,
++            dict(
++                volumes=0,
++                snapshots=0,
++                gigabytes=0,
++                backups=0,
++                backup_gigabytes=0,
++                per_volume_gigabytes=0))
++
+     def _stub_quota_class_get_default(self):
+         # Stub out quota_class_get_default
+         def fake_qcgd(context):
+@@ -865,6 +938,13 @@ class DbQuotaDriverTestCase(test.TestCase):
+                         )
+         self.stubs.Set(db, 'quota_class_get_default', fake_qcgd)
+ 
++    def _stub_quota_class_get_default_subproject(self):
++        # Stub out quota_class_get_default for subprojects
++        def fake_qcgd(context):
++            self.calls.append('quota_class_get_default')
++            return {}
++        self.stubs.Set(db, 'quota_class_get_default', fake_qcgd)
++
+     def _stub_volume_type_get_all(self):
+         def fake_vtga(context, inactive=False, filters=None):
+             return {}
+@@ -929,6 +1009,24 @@ class DbQuotaDriverTestCase(test.TestCase):
+         self._stub_quota_class_get_all_by_name()
+         self._stub_quota_class_get_default()
+ 
++    def _stub_get_by_subproject(self):
++        def fake_qgabp(context, project_id):
++            self.calls.append('quota_get_all_by_project')
++            self.assertEqual(project_id, 'test_project')
++            return dict(volumes=10, gigabytes=50, reserved=0)
++
++        def fake_qugabp(context, project_id):
++            self.calls.append('quota_usage_get_all_by_project')
++            self.assertEqual(project_id, 'test_project')
++            return dict(volumes=dict(in_use=2, reserved=0),
++                        gigabytes=dict(in_use=10, reserved=0))
++
++        self.stubs.Set(db, 'quota_get_all_by_project', fake_qgabp)
++        self.stubs.Set(db, 'quota_usage_get_all_by_project', fake_qugabp)
++
++        self._stub_quota_class_get_all_by_name()
++        self._stub_quota_class_get_default_subproject()
++
+     def test_get_project_quotas(self):
+         self._stub_get_by_project()
+         self._stub_volume_type_get_all()
+@@ -960,6 +1058,38 @@ class DbQuotaDriverTestCase(test.TestCase):
+                                                                 reserved= 0)
+                                       ))
+ 
++    def test_get_subproject_quotas(self):
++        self._stub_get_by_subproject()
++        self._stub_volume_type_get_all()
++        parent_project_id = 'test_parent_project_id'
++        result = self.driver.get_project_quotas(
++            FakeContext('test_project', None),
++            quota.QUOTAS.resources, 'test_project',
++            parent_project_id=parent_project_id)
++
++        self.assertEqual(self.calls, ['quota_get_all_by_project',
++                                      'quota_usage_get_all_by_project',
++                                      'quota_class_get_default', ])
++        self.assertEqual(result, dict(volumes=dict(limit=10,
++                                                   in_use=2,
++                                                   reserved=0, ),
++                                      snapshots=dict(limit=0,
++                                                     in_use=0,
++                                                     reserved=0, ),
++                                      gigabytes=dict(limit=50,
++                                                     in_use=10,
++                                                     reserved=0, ),
++                                      backups=dict(limit=0,
++                                                   in_use=0,
++                                                   reserved=0, ),
++                                      backup_gigabytes=dict(limit=0,
++                                                            in_use=0,
++                                                            reserved=0, ),
++                                      per_volume_gigabytes=dict(in_use=0,
++                                                                limit=0,
++                                                                reserved= 0)
++                                      ))
++
+     def test_get_project_quotas_alt_context_no_class(self):
+         self._stub_get_by_project()
+         self._stub_volume_type_get_all()
+@@ -1073,7 +1203,7 @@ class DbQuotaDriverTestCase(test.TestCase):
+     def _stub_get_project_quotas(self):
+         def fake_get_project_quotas(context, resources, project_id,
+                                     quota_class=None, defaults=True,
+-                                    usages=True):
++                                    usages=True, parent_project_id=None):
+             self.calls.append('get_project_quotas')
+             return {k: dict(limit=v.default) for k, v in resources.items()}
+ 
+-- 
+1.9.1
+

@@ -1,0 +1,115 @@
+From d520cdf77b1f2596e23cdc6b903708abd1dfdc57 Mon Sep 17 00:00:00 2001
+From: Raildo Mascena <raildo@lsd.ufcg.edu.br>
+Date: Fri, 6 Nov 2015 11:16:40 -0300
+Subject: [PATCH] Nested Quota Driver: Create Column Allocated
+
+To represent the quotas allocated for the immediate child
+projects we need to create a new column,"allocated" in Quota
+table, that will be the sum of the "hard_limit" values of
+the immediate child projects.
+
+Co-Authored-By: Sajeesh CS <sajeesh.cs@cern.ch>
+Co-Authored-By: Erickson Santos <erickson@lsd.ufcg.edu.br>
+Co-Authored-By: Vilobh Meshram <vilobhmm@yahoo-inc.com>
+
+Partially Implements:  bp nested-quota-driver-api
+
+Change-Id: I2b2692b608ae8afe496bf210de6711b94657d30c
+---
+ .../versions/313_add_allocated_in_quotas.py        | 30 ++++++++++++++++++++++
+ nova/db/sqlalchemy/models.py                       |  5 ++++
+ nova/tests/unit/db/test_migrations.py              | 25 ++++++++++++++++++
+ 3 files changed, 60 insertions(+)
+ create mode 100644 nova/db/sqlalchemy/migrate_repo/versions/313_add_allocated_in_quotas.py
+
+diff --git a/nova/db/sqlalchemy/migrate_repo/versions/313_add_allocated_in_quotas.py b/nova/db/sqlalchemy/migrate_repo/versions/313_add_allocated_in_quotas.py
+new file mode 100644
+index 0000000..2399b87
+--- /dev/null
++++ b/nova/db/sqlalchemy/migrate_repo/versions/313_add_allocated_in_quotas.py
+@@ -0,0 +1,30 @@
++# Copyright 2015 OpenStack Foundation
++# All Rights Reserved
++#
++#    Licensed under the Apache License, Version 2.0 (the "License"); you may
++#    not use this file except in compliance with the License. You may obtain
++#    a copy of the License at
++#
++#         http://www.apache.org/licenses/LICENSE-2.0
++#
++#    Unless required by applicable law or agreed to in writing, software
++#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
++#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
++#    License for the specific language governing permissions and limitations
++#    under the License.
++
++from sqlalchemy import Column, Integer, MetaData, Table
++
++
++def upgrade(migrate_engine):
++    meta = MetaData(bind=migrate_engine)
++
++    quotas = Table('quotas', meta, autoload=True)
++    shadow_quotas = Table('shadow_quotas', meta, autoload=True)
++
++    # Add a new column allocated to save allocated quota
++    allocated = Column('allocated', Integer, default=0)
++    if not hasattr(quotas.c, 'allocated'):
++        quotas.create_column(allocated)
++    if not hasattr(shadow_quotas.c, 'allocated'):
++        shadow_quotas.create_column(allocated.copy())
+diff --git a/nova/db/sqlalchemy/models.py b/nova/db/sqlalchemy/models.py
+index b8ba6c7..c3c23ac 100644
+--- a/nova/db/sqlalchemy/models.py
++++ b/nova/db/sqlalchemy/models.py
+@@ -432,6 +432,11 @@ class Quota(BASE, NovaBase, models.SoftDeleteMixin):
+     resource = Column(String(255), nullable=False)
+     hard_limit = Column(Integer)
+ 
++    # allocated is the sum of the quota hard_limit values of immediate child
++    # projects. It defaults to 0, since it will be zero till the parent project
++    # allocated a finite quota to its immediate child projects
++    allocated = Column(Integer, default=0)
++
+ 
+ class ProjectUserQuota(BASE, NovaBase, models.SoftDeleteMixin):
+     """Represents a single quota override for a user with in a project."""
+diff --git a/nova/tests/unit/db/test_migrations.py b/nova/tests/unit/db/test_migrations.py
+index 9c21b40..e587b04 100644
+--- a/nova/tests/unit/db/test_migrations.py
++++ b/nova/tests/unit/db/test_migrations.py
+@@ -805,6 +805,31 @@ class NovaMigrationsCheckers(test_migrations.ModelsMigrationsSync,
+         self.assertIndexMembers(engine, 'instance_system_metadata',
+                                 'instance_uuid', ['instance_uuid'])
+ 
++    def _pre_upgrade_313(self, engine):
++        # create a fake quota for checking whether allocated quota will
++        # take default value 0
++        quotas = oslodbutils.get_table(engine, 'quotas')
++        fake_quota = {'id': 1, 'resource': 'fake'}
++        quotas.insert().execute(fake_quota)
++
++    def _check_313(self, engine, data):
++        self.assertColumnExists(engine, 'quotas', 'allocated')
++        self.assertColumnExists(engine, 'shadow_quotas', 'allocated')
++        quotas = oslodbutils.get_table(engine, 'quotas')
++        shadow_quotas = oslodbutils.get_table(engine, 'shadow_quotas')
++
++        # Make sure that a new quota entry will have default
++        # allocated quota value as 0
++        quotas = oslodbutils.get_table(engine, 'quotas')
++        quota = quotas.select(
++            quotas.c.id == 1).execute().first()
++        self.assertEqual(0, quota.allocated)
++
++        self.assertIsInstance(quotas.c.allocated.type,
++                              sqlalchemy.types.Integer)
++        self.assertIsInstance(shadow_quotas.c.allocated.type,
++                              sqlalchemy.types.Integer)
++
+ 
+ class TestNovaMigrationsSQLite(NovaMigrationsCheckers,
+                                test_base.DbTestCase,
+-- 
+1.9.1
+
